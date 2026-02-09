@@ -50,7 +50,7 @@ class Config:
     BATCH_SIZE = 1
     GRADIENT_ACCUMULATION = 8
     LEARNING_RATE = 2e-4
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 4
     WARMUP_STEPS = 50
     
     FP16 = True
@@ -61,7 +61,7 @@ class Config:
     EVAL_STEPS = 500
     LOGGING_STEPS = 50
     
-    UPLOAD_TO_HF = False
+    UPLOAD_TO_HF = True
     HF_REPO_NAME = "yusufbukarmaina/beaker-volume-models"
 
 
