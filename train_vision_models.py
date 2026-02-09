@@ -73,7 +73,7 @@ class Config:
     LOGGING_STEPS = 50
     
     # HuggingFace upload
-    UPLOAD_TO_HF = False
+    UPLOAD_TO_HF = True
     HF_REPO_NAME = "yusufbukarmaina/beaker-volume-models"
 
 
