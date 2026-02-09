@@ -114,12 +114,8 @@ class DatasetProcessor:
         
         try:
             # Load full dataset in streaming mode
-            dataset = load_dataset(
-                self.config.HF_DATASET_NAME,
-                split="train",
-                streaming=self.config.STREAMING,
-                trust_remote_code=True
-            )
+            from datasets import load_dataset
+            dataset = load_dataset("yusufbukarmaina/Beakers1")
             
             # Shuffle the dataset
             dataset = dataset.shuffle(seed=42, buffer_size=1000)
