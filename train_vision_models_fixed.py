@@ -396,7 +396,7 @@ class FlorenceTrainer:
             logging_steps=self.config.LOGGING_STEPS,
             save_steps=self.config.SAVE_STEPS,
             eval_steps=self.config.EVAL_STEPS,
-            evaluation_strategy="steps",
+            eval_strategy="steps",  # Fixed: was evaluation_strategy
             save_strategy="steps",
             save_total_limit=2,
             load_best_model_at_end=True,
@@ -629,7 +629,7 @@ class QwenTrainer:
             logging_steps=self.config.LOGGING_STEPS,
             save_steps=self.config.SAVE_STEPS,
             eval_steps=self.config.EVAL_STEPS,
-            evaluation_strategy="steps",
+            eval_strategy="steps",  # Fixed: was evaluation_strategy
             save_strategy="steps",
             save_total_limit=2,
             load_best_model_at_end=True,
