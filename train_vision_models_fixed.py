@@ -27,6 +27,8 @@ import warnings
 import gc
 from pathlib import Path
 warnings.filterwarnings('ignore')
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Force single GPU
 
 # ============================================================================
 # CONFIGURATION - OPTIMIZED FOR RTX 6000 (24GB VRAM)
