@@ -38,8 +38,8 @@ class Config:
     STREAMING = True  # Essential for memory management
     
     # Dataset sizes - YOUR EXACT REQUIREMENTS
-    TRAIN_SAMPLES = 500
-    VAL_SAMPLES =  150
+    TRAIN_SAMPLES = 1000
+    VAL_SAMPLES = 300
     TEST_SAMPLES = 300
     TOTAL_SAMPLES = 1600
     
@@ -54,12 +54,12 @@ class Config:
     LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj"]
     
     # Training settings - REDUCED FOR RTX 6000
-    BATCH_SIZE = 1  # Reduced from 4 for 24GB VRAM
+    BATCH_SIZE = 2  # Reduced from 4 for 24GB VRAM
     GRADIENT_ACCUMULATION = 8  # Increased to maintain effective batch size of 16
     LEARNING_RATE = 2e-4
     NUM_EPOCHS = 10
     WARMUP_STEPS = 50
-    MAX_LENGTH = 256
+    MAX_LENGTH = 512
     
     # Memory optimization
     FP16 = True
@@ -295,13 +295,16 @@ class FlorenceTrainer:
             )
             
             # Load model with FP16
+            # ✅ FIX: Don't use device_map="auto" for Florence-2, manually move to GPU
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.config.FLORENCE_MODEL,
                 trust_remote_code=True,
                 torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
-                device_map="auto",
                 low_cpu_mem_usage=True
             )
+            
+            # Manually move to GPU
+            self.model = self.model.to('cuda')
             
             print_memory_usage()
             
@@ -515,13 +518,27 @@ class QwenTrainer:
             )
             
             # Load model with FP16
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                self.config.QWEN_MODEL,
-                trust_remote_code=True,
-                torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
-                device_map="auto",
-                low_cpu_mem_usage=True
-            )
+            # ✅ TRY device_map="auto" first, fallback to manual GPU if it fails
+            try:
+                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.config.QWEN_MODEL,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
+                    device_map="auto",
+                    low_cpu_mem_usage=True
+                )
+            except ValueError as e:
+                if "doesn't have any device set" in str(e):
+                    print("⚠️ device_map='auto' failed, loading to GPU directly...")
+                    self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                        self.config.QWEN_MODEL,
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
+                        low_cpu_mem_usage=True
+                    )
+                    self.model = self.model.to('cuda')
+                else:
+                    raise
             
             print_memory_usage()
             
