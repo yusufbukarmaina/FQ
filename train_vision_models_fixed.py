@@ -1,10 +1,13 @@
 """
 Complete Training Pipeline for Florence-2 and Qwen2.5-VL
-Updated version: fixes Florence-2 OverflowError (negative int to unsigned) by:
-  - avoiding padding="max_length" in Florence processor/tokenizer calls
-  - using short label max_length=64
-  - masking pad tokens in labels to -100
-  - setting dataloader_num_workers=0 for stability
+Updated version: fixes Florence-2 batching crash:
+  RuntimeError: stack expects each tensor to be equal size ...
+
+✅ Fix applied:
+  - Add a custom Florence data_collator that pads variable-length tensors
+  - Keep Florence dynamic padding (padding=True) to avoid OverflowError
+  - Mask pad tokens in labels to -100
+  - dataloader_num_workers=0 for stability
 Also removes trust_remote_code from load_dataset (per HF warning).
 """
 
@@ -38,7 +41,7 @@ warnings.filterwarnings("ignore")
 class Config:
     # Dataset settings
     HF_DATASET_NAME = "yusufbukarmaina/Beakers1"
-    STREAMING = True  # Essential for memory management
+    STREAMING = True
 
     # Dataset sizes
     TRAIN_SAMPLES = 500
@@ -63,7 +66,7 @@ class Config:
     NUM_EPOCHS = 10
     WARMUP_STEPS = 50
 
-    # NOTE: keep MAX_LENGTH for Qwen; Florence will use dynamic padding
+    # NOTE: keep MAX_LENGTH for Qwen; Florence uses dynamic padding
     MAX_LENGTH = 256
 
     # Memory optimization
@@ -97,6 +100,48 @@ def print_memory_usage():
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
         print(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+
+# ============================================================================
+# FLORENCE COLLATOR (✅ REQUIRED FIX)
+# ============================================================================
+
+def florence_collate_fn(features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    Pads variable-length tensors for Florence-2 batches so Trainer/Dataloader can stack.
+    Expects each feature dict to include:
+      - pixel_values: (C,H,W) tensor
+      - input_ids: (L,) tensor
+      - attention_mask: (L,) tensor
+      - labels: (L_label,) tensor (already has -100 where padded)
+    """
+    # pixel_values are fixed size
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
+
+    # pad ids
+    # (we keep input_ids padding_value=0; attention_mask padding_value=0; labels padding_value=-100)
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [f["input_ids"] for f in features],
+        batch_first=True,
+        padding_value=0
+    )
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [f["attention_mask"] for f in features],
+        batch_first=True,
+        padding_value=0
+    )
+    labels = torch.nn.utils.rnn.pad_sequence(
+        [f["labels"] for f in features],
+        batch_first=True,
+        padding_value=-100
+    )
+
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
 
 
 # ============================================================================
@@ -247,9 +292,10 @@ class FlorenceTrainer:
 
         clear_memory()
 
+        # Florence needs trust_remote_code (HF publishes custom processor/modeling)
         self.processor = AutoProcessor.from_pretrained(
             self.config.FLORENCE_MODEL,
-            trust_remote_code=True,  # Florence still needs this
+            trust_remote_code=True,
         )
 
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -292,7 +338,6 @@ class FlorenceTrainer:
         output_dir = f"{self.config.OUTPUT_DIR}/florence2"
         os.makedirs(output_dir, exist_ok=True)
 
-        # ✅ FIX: dataloader_num_workers=0 for stability; pin_memory off
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=self.config.NUM_EPOCHS,
@@ -311,8 +356,8 @@ class FlorenceTrainer:
             metric_for_best_model="loss",
             greater_is_better=False,
             fp16=self.config.FP16,
-            dataloader_num_workers=0,
-            dataloader_pin_memory=False,
+            dataloader_num_workers=0,      # ✅ stability
+            dataloader_pin_memory=False,   # ✅ stability
             remove_unused_columns=False,
             push_to_hub=False,
             report_to="tensorboard",
@@ -324,13 +369,12 @@ class FlorenceTrainer:
 
         class FlorenceDataset(torch.utils.data.Dataset):
             """
-            ✅ FIX: Avoid padding="max_length" for Florence to prevent
-            OverflowError: can't convert negative int to unsigned
+            ✅ Dynamic padding to avoid OverflowError.
+            ✅ Labels padded/masked to -100.
             """
-            def __init__(self, data, processor, config):
+            def __init__(self, data, processor):
                 self.data = data
                 self.processor = processor
-                self.config = config
                 self.pad_id = processor.tokenizer.pad_token_id
 
             def __len__(self):
@@ -353,7 +397,7 @@ class FlorenceTrainer:
                 if not answer:
                     answer = "0 mL"
 
-                # ✅ FIX: dynamic padding (no max_length) for inputs
+                # ✅ dynamic padding (variable lengths)
                 inputs = self.processor(
                     images=image,
                     text=prompt,
@@ -362,7 +406,7 @@ class FlorenceTrainer:
                     truncation=True,
                 )
 
-                # ✅ FIX: keep labels short and stable
+                # keep labels short & stable
                 ans = self.processor.tokenizer(
                     answer,
                     return_tensors="pt",
@@ -374,20 +418,30 @@ class FlorenceTrainer:
                 inputs = {k: v.squeeze(0) for k, v in inputs.items()}
                 labels = ans["input_ids"].squeeze(0).clone()
 
-                # ✅ FIX: ignore pad tokens in loss
-                labels[labels == self.pad_id] = -100
+                # mask pad tokens in labels
+                if self.pad_id is not None:
+                    labels[labels == self.pad_id] = -100
+                else:
+                    # safe fallback: no pad id known, leave labels as-is
+                    pass
+
                 inputs["labels"] = labels
+
+                # IMPORTANT: ensure expected key exists for collator
+                if "pixel_values" not in inputs:
+                    raise KeyError(f"Florence processor output missing 'pixel_values'. Keys: {list(inputs.keys())}")
 
                 return inputs
 
-        train_dataset = FlorenceDataset(train_data, self.processor, self.config)
-        eval_dataset = FlorenceDataset(val_data, self.processor, self.config)
+        train_dataset = FlorenceDataset(train_data, self.processor)
+        eval_dataset = FlorenceDataset(val_data, self.processor)
 
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            data_collator=florence_collate_fn,  # ✅ CRITICAL FIX
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         )
 
@@ -407,7 +461,7 @@ class FlorenceTrainer:
 
 
 # ============================================================================
-# QWEN2.5-VL TRAINING (unchanged, but you can also switch to dynamic padding)
+# QWEN2.5-VL TRAINING (unchanged)
 # ============================================================================
 
 class QwenTrainer:
@@ -497,8 +551,8 @@ class QwenTrainer:
             metric_for_best_model="loss",
             greater_is_better=False,
             fp16=self.config.FP16,
-            dataloader_num_workers=0,      # ✅ more stable
-            dataloader_pin_memory=False,   # ✅ more stable
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
             remove_unused_columns=False,
             push_to_hub=False,
             report_to="tensorboard",
@@ -675,7 +729,6 @@ class ModelEvaluator:
         print(f"   RMSE: {rmse:.2f} mL")
         print(f"   R²:   {r2:.4f}")
 
-        # NOTE: Your plot function used subplots; keep as-is if you like.
         return {"mae": float(mae), "rmse": float(rmse), "r2": float(r2)}
 
 
