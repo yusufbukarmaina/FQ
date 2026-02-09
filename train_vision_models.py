@@ -118,7 +118,9 @@ class DatasetProcessor:
             dataset = load_dataset("yusufbukarmaina/Beakers1")
             
             # Shuffle the dataset
+            dataset = load_dataset("yusufbukarmaina/Beakers1", split="train", streaming=True)
             dataset = dataset.shuffle(seed=42, buffer_size=1000)
+
             
             print("📊 Creating splits with streaming...")
             
