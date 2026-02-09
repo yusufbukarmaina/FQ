@@ -26,7 +26,6 @@ from typing import Dict, List, Tuple
 import warnings
 import gc
 from pathlib import Path
-from qwen_vl_utils import process_vision_info
 
 warnings.filterwarnings('ignore')
 
@@ -70,7 +69,7 @@ class Config:
     EVAL_STEPS = 500
     LOGGING_STEPS = 50
     
-    UPLOAD_TO_HF = True
+    UPLOAD_TO_HF = False
     HF_REPO_NAME = "yusufbukarmaina/beaker-volume-models"
 
 
