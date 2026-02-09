@@ -38,8 +38,8 @@ class Config:
     STREAMING = True  # Essential for memory management
     
     # Dataset sizes - YOUR EXACT REQUIREMENTS
-    TRAIN_SAMPLES = 1000
-    VAL_SAMPLES = 300
+    TRAIN_SAMPLES = 500
+    VAL_SAMPLES = 150
     TEST_SAMPLES = 300
     TOTAL_SAMPLES = 1600
     
@@ -54,12 +54,12 @@ class Config:
     LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj"]
     
     # Training settings - REDUCED FOR RTX 6000
-    BATCH_SIZE = 2  # Reduced from 4 for 24GB VRAM
+    BATCH_SIZE = 1  # Reduced from 4 for 24GB VRAM
     GRADIENT_ACCUMULATION = 8  # Increased to maintain effective batch size of 16
     LEARNING_RATE = 2e-4
     NUM_EPOCHS = 10
     WARMUP_STEPS = 50
-    MAX_LENGTH = 512
+    MAX_LENGTH = 256
     
     # Memory optimization
     FP16 = True
