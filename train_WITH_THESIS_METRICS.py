@@ -221,8 +221,8 @@ class Config:
     HF_DATASET_NAME = "yusufbukarmaina/Beakers1"
     STREAMING = True
     
-    TRAIN_SAMPLES = 1000
-    VAL_SAMPLES = 300
+    TRAIN_SAMPLES = 800
+    VAL_SAMPLES = 150
     TEST_SAMPLES = 300
     
     FLORENCE_MODEL = "microsoft/Florence-2-base"
