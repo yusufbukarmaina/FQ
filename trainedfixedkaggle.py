@@ -1,21 +1,31 @@
 """
-Complete Training Pipeline for Florence-2 and Qwen2.5-VL
-✅ Converted/optimized for NVIDIA Tesla P100 (16GB VRAM)
+✅ Kaggle 2×T4 (16GB each) Training Pipeline
+Florence-2 + Qwen2-VL-2B-Instruct with LoRA + 4-bit (recommended)
 
-Key P100 changes:
-- Smaller micro-batch (BATCH_SIZE=1) + higher gradient accumulation
-- 4-bit quantization (bitsandbytes) to fit models in 16GB
-- More aggressive max_length and image/token memory control
-- dataloader workers = 0 (stability), pin_memory off
-- fp16 enabled (P100 supports FP16), bf16 disabled
-- safer dynamic padding + custom collators (avoids stacking errors)
+Run (2 GPUs):
+  torchrun --nproc_per_node=2 train_t4x2.py
+
+Notes:
+- T4 supports FP16, NOT BF16.
+- 4-bit (bitsandbytes) is strongly recommended for Qwen2-VL on 16GB.
+- Uses DDP automatically when launched via torchrun.
 """
 
 import os
 import json
+import gc
+import re
+import warnings
+from typing import Dict, List
+
 import torch
 import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+
 from datasets import load_dataset
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
 from transformers import (
     AutoProcessor,
     AutoModelForCausalLM,
@@ -24,27 +34,24 @@ from transformers import (
     Trainer,
     EarlyStoppingCallback,
 )
+
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import matplotlib.pyplot as plt
-from PIL import Image
-import re
-from typing import Dict, List
-import warnings
-import gc
+
 warnings.filterwarnings("ignore")
 
-# Optional: bitsandbytes 4-bit
+# ---------------------------
+# bitsandbytes / 4-bit
+# ---------------------------
 try:
     from transformers import BitsAndBytesConfig
-    _HAS_BNB = True
+    HAS_BNB = True
 except Exception:
     BitsAndBytesConfig = None
-    _HAS_BNB = False
+    HAS_BNB = False
 
 
 # ============================================================================
-# CONFIGURATION - OPTIMIZED FOR TESLA P100 (16GB)
+# CONFIG (T4×2)
 # ============================================================================
 
 class Config:
@@ -61,31 +68,32 @@ class Config:
     FLORENCE_MODEL = "microsoft/Florence-2-base"
     QWEN_MODEL     = "Qwen/Qwen2-VL-2B-Instruct"
 
-    # LoRA (keep modest on P100)
+    # LoRA
     LORA_R = 8
     LORA_ALPHA = 16
     LORA_DROPOUT = 0.05
     LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
-    # Training (P100 memory-friendly)
-    BATCH_SIZE = 1                     # ↓ micro-batch for 16GB
-    GRADIENT_ACCUMULATION = 16         # ↑ keep effective batch = 16
+    # Training (2×T4)
+    # With 2 GPUs, per_device_train_batch_size=2 often works in 4-bit + checkpointing.
+    # If OOM, set BATCH_SIZE=1 and increase GRAD_ACCUM.
+    BATCH_SIZE = 2
+    GRADIENT_ACCUMULATION = 8  # effective batch = 2(gpu)*2(batch)*8 = 32
     LEARNING_RATE = 2e-4
-    NUM_EPOCHS = 8                     # often enough; reduce if slow
+    NUM_EPOCHS = 8
     WARMUP_STEPS = 50
 
-    # Token length (reduce to save VRAM)
-    MAX_LENGTH = 384                   # was 512; reduce for P100
+    # Sequence length (reduce if OOM)
+    MAX_LENGTH = 384
 
     # Memory
     FP16 = True
     GRADIENT_CHECKPOINTING = True
-    USE_4BIT = True                    # IMPORTANT for P100
-    # If bitsandbytes missing, it will fallback automatically.
+    USE_4BIT = True
 
-    # Output
-    OUTPUT_DIR = "./trained_models"
-    TEST_IMAGES_DIR = "./test_images_export"   # safer than "/FQ/..."
+    # I/O
+    OUTPUT_DIR = "./trained_models_t4x2"
+    TEST_IMAGES_DIR = "./test_images_export_t4x2"
     SAVE_STEPS = 600
     EVAL_STEPS = 600
     LOGGING_STEPS = 50
@@ -96,7 +104,25 @@ class Config:
 
 
 # ============================================================================
-# UTILS
+# DDP helpers
+# ============================================================================
+
+def is_distributed() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+def is_main_process() -> bool:
+    return (not is_distributed()) or torch.distributed.get_rank() == 0
+
+def rank0_print(*args, **kwargs):
+    if is_main_process():
+        print(*args, **kwargs)
+
+def barrier():
+    if is_distributed():
+        torch.distributed.barrier()
+
+# ============================================================================
+# Utils
 # ============================================================================
 
 def clear_memory():
@@ -106,37 +132,30 @@ def clear_memory():
         torch.cuda.synchronize()
 
 def print_memory_usage():
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and is_main_process():
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved  = torch.cuda.memory_reserved() / 1e9
         print(f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
 def get_bnb_config():
-    """
-    4-bit config that works well on 16GB GPUs.
-    Note: compute dtype float16 (P100 supports fp16).
-    """
-    if not (_HAS_BNB and Config.USE_4BIT):
+    if not (HAS_BNB and Config.USE_4BIT):
         return None
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.float16,  # T4: fp16
     )
 
 def pick_optim():
-    """
-    If bitsandbytes is present, paged_adamw_8bit is usually more memory-friendly.
-    Otherwise use adamw_torch.
-    """
-    if _HAS_BNB and Config.USE_4BIT:
+    # if bnb 4-bit available, use paged adamw 8bit (memory-friendly)
+    if HAS_BNB and Config.USE_4BIT:
         return "paged_adamw_8bit"
     return "adamw_torch"
 
 
 # ============================================================================
-# COLLATORS (PADDING FIXES)
+# Collators (variable length padding)
 # ============================================================================
 
 def pad_1d(seqs: List[torch.Tensor], pad_value: int):
@@ -147,43 +166,34 @@ def florence_collate_fn(features: List[Dict[str, torch.Tensor]]) -> Dict[str, to
     input_ids = pad_1d([f["input_ids"] for f in features], pad_value=0)
     attention_mask = pad_1d([f["attention_mask"] for f in features], pad_value=0)
     labels = pad_1d([f["labels"] for f in features], pad_value=-100)
-    return dict(
-        pixel_values=pixel_values,
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=labels,
-    )
+    return dict(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
 def qwen_collate_fn(features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """
-    Qwen2-VL processor returns multiple tensors; some are variable-length (input_ids/attention_mask/labels),
-    others are fixed-ish (pixel_values, image_grid_thw). We pad the variable-length ones.
-    """
     batch = {}
-    # stack fixed keys if present
-    fixed_keys = ["pixel_values", "image_grid_thw"]
-    for k in fixed_keys:
+    # fixed-ish tensors
+    for k in ["pixel_values", "image_grid_thw"]:
         if k in features[0]:
             batch[k] = torch.stack([f[k] for f in features])
 
-    # pad variable length keys
+    # variable length
     for k, padv in [("input_ids", 0), ("attention_mask", 0), ("labels", -100)]:
         if k in features[0]:
             batch[k] = pad_1d([f[k] for f in features], pad_value=padv)
 
-    # pass through any other keys (rare)
+    # passthrough others if stackable
     for k in features[0].keys():
-        if k not in batch:
-            try:
-                batch[k] = torch.stack([f[k] for f in features])
-            except Exception:
-                # ignore if cannot stack (better to fail early, but we keep it safe)
-                pass
+        if k in batch:
+            continue
+        try:
+            batch[k] = torch.stack([f[k] for f in features])
+        except Exception:
+            pass
+
     return batch
 
 
 # ============================================================================
-# DATA PROCESSING
+# Data
 # ============================================================================
 
 class DatasetProcessor:
@@ -191,11 +201,11 @@ class DatasetProcessor:
         self.config = config
 
     def load_and_split_dataset(self):
-        print("📥 Loading dataset with streaming...")
-        print(f"Dataset: {self.config.HF_DATASET_NAME}")
-        print(f"Target: {self.config.TRAIN_SAMPLES} train, {self.config.VAL_SAMPLES} val, {self.config.TEST_SAMPLES} test")
+        rank0_print("📥 Loading dataset with streaming...")
+        rank0_print(f"Dataset: {self.config.HF_DATASET_NAME}")
+        rank0_print(f"Target: {self.config.TRAIN_SAMPLES} train, {self.config.VAL_SAMPLES} val, {self.config.TEST_SAMPLES} test")
 
-        dataset = load_dataset(
+        ds = load_dataset(
             self.config.HF_DATASET_NAME,
             split="train",
             streaming=self.config.STREAMING
@@ -204,36 +214,36 @@ class DatasetProcessor:
         train_data, val_data, test_data = [], [], []
         total_processed, skipped = 0, 0
 
-        for example in dataset:
-            if "image" not in example:
+        for ex in ds:
+            if "image" not in ex:
                 skipped += 1
                 continue
-            if "volume_ml" not in example and "volume_label" not in example:
+            if "volume_ml" not in ex and "volume_label" not in ex:
                 skipped += 1
                 continue
 
             if len(train_data) < self.config.TRAIN_SAMPLES:
-                train_data.append(example)
+                train_data.append(ex)
             elif len(val_data) < self.config.VAL_SAMPLES:
-                val_data.append(example)
+                val_data.append(ex)
             elif len(test_data) < self.config.TEST_SAMPLES:
-                test_data.append(example)
+                test_data.append(ex)
             else:
                 break
 
             total_processed += 1
             if total_processed % 100 == 0:
-                print(f"✓ Processed {total_processed} - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
+                rank0_print(f"✓ Processed {total_processed} - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
 
-            if total_processed > self.config.TOTAL_SAMPLES + 500:
-                print("⚠️ Safety limit reached, stopping.")
+            if total_processed > self.config.TOTAL_SAMPLES + 800:
+                rank0_print("⚠️ Safety limit reached, stopping.")
                 break
 
-        print("\n✅ Dataset split complete:")
-        print(f"   Train: {len(train_data)} examples")
-        print(f"   Val:   {len(val_data)} examples")
-        print(f"   Test:  {len(test_data)} examples")
-        print(f"   Skipped: {skipped} examples (missing fields)")
+        rank0_print("\n✅ Dataset split complete:")
+        rank0_print(f"   Train: {len(train_data)} examples")
+        rank0_print(f"   Val:   {len(val_data)} examples")
+        rank0_print(f"   Test:  {len(test_data)} examples")
+        rank0_print(f"   Skipped: {skipped} examples (missing fields)")
 
         return train_data, val_data, test_data
 
@@ -244,8 +254,8 @@ class DatasetProcessor:
         patterns = [
             r"(\d+\.?\d*)\s*mL",
             r"(\d+\.?\d*)\s*ml",
-            r"(\d+\.?\d*)\s*milliliters?",
             r"(\d+\.?\d*)\s*ML",
+            r"(\d+\.?\d*)\s*milliliters?",
         ]
         for p in patterns:
             m = re.search(p, text, re.IGNORECASE)
@@ -255,42 +265,37 @@ class DatasetProcessor:
         return float(nums[0]) if nums else 0.0
 
     def save_test_images(self, test_data: List[Dict], output_dir: str):
-        print(f"\n💾 Saving {len(test_data)} test images to {output_dir}...")
+        if not is_main_process():
+            return
+        rank0_print(f"\n💾 Saving {len(test_data)} test images to {output_dir}...")
         os.makedirs(output_dir, exist_ok=True)
-        metadata = []
+        meta = []
 
-        for idx, example in enumerate(test_data):
+        for i, ex in enumerate(test_data):
             try:
-                image = Image.open(example["image"]).convert("RGB") if isinstance(example["image"], str) else example["image"].convert("RGB")
-                gt_text = example.get("volume_label", "")
-                if not gt_text and "volume_ml" in example:
-                    gt_text = f"{example['volume_ml']} mL"
-                gt_volume = self.extract_volume_from_text(gt_text)
+                img = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
+                gt_text = ex.get("volume_label", "")
+                if not gt_text and "volume_ml" in ex:
+                    gt_text = f"{ex['volume_ml']} mL"
+                gt_v = self.extract_volume_from_text(gt_text)
 
-                filename = f"test_{idx:04d}_volume_{gt_volume:.1f}mL.jpg"
-                image.save(os.path.join(output_dir, filename), quality=95)
+                fn = f"test_{i:04d}_volume_{gt_v:.1f}mL.jpg"
+                img.save(os.path.join(output_dir, fn), quality=95)
+                meta.append({"index": i, "filename": fn, "ground_truth_volume": gt_v, "ground_truth_text": gt_text})
 
-                metadata.append({
-                    "index": idx,
-                    "filename": filename,
-                    "ground_truth_volume": gt_volume,
-                    "ground_truth_text": gt_text,
-                })
-
-                if (idx + 1) % 50 == 0:
-                    print(f"  Saved {idx + 1}/{len(test_data)} images...")
-
+                if (i + 1) % 50 == 0:
+                    rank0_print(f"  Saved {i+1}/{len(test_data)}")
             except Exception as e:
-                print(f"⚠️ Error saving test image {idx}: {e}")
+                rank0_print(f"⚠️ Save error {i}: {e}")
 
         with open(os.path.join(output_dir, "test_metadata.json"), "w") as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(meta, f, indent=2)
 
-        print("✅ Test images + metadata saved.")
+        rank0_print("✅ Test images + metadata saved.")
 
 
 # ============================================================================
-# FLORENCE-2 TRAINING (P100)
+# Florence-2 Trainer
 # ============================================================================
 
 class FlorenceTrainer:
@@ -300,34 +305,28 @@ class FlorenceTrainer:
         self.model = None
 
     def setup_model(self):
-        print(f"\n🤖 Setting up Florence-2: {self.config.FLORENCE_MODEL}")
+        rank0_print(f"\n🤖 Setting up Florence-2: {self.config.FLORENCE_MODEL}")
         clear_memory()
+        bnb = get_bnb_config()
 
-        bnb_config = get_bnb_config()
+        self.processor = AutoProcessor.from_pretrained(self.config.FLORENCE_MODEL, trust_remote_code=True)
 
-        self.processor = AutoProcessor.from_pretrained(
-            self.config.FLORENCE_MODEL,
-            trust_remote_code=True
-        )
-
-        # For P100: prefer 4-bit if available
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.FLORENCE_MODEL,
             trust_remote_code=True,
             device_map="auto",
             torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
             low_cpu_mem_usage=True,
-            quantization_config=bnb_config if bnb_config is not None else None,
+            quantization_config=bnb if bnb is not None else None,
         )
 
         if self.config.GRADIENT_CHECKPOINTING:
             self.model.gradient_checkpointing_enable()
-            print("✓ Gradient checkpointing enabled")
+            rank0_print("✓ Gradient checkpointing enabled")
 
-        # Required for LoRA + k-bit
         self.model = prepare_model_for_kbit_training(self.model)
 
-        lora_config = LoraConfig(
+        lora_cfg = LoraConfig(
             r=self.config.LORA_R,
             lora_alpha=self.config.LORA_ALPHA,
             target_modules=self.config.LORA_TARGET_MODULES,
@@ -335,18 +334,18 @@ class FlorenceTrainer:
             bias="none",
             task_type="CAUSAL_LM",
         )
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
-
+        self.model = get_peft_model(self.model, lora_cfg)
+        if is_main_process():
+            self.model.print_trainable_parameters()
         print_memory_usage()
         return self.model, self.processor
 
     def train(self, train_data: List[Dict], val_data: List[Dict]) -> str:
         self.setup_model()
-        out_dir = f"{self.config.OUTPUT_DIR}/florence2_p100"
+        out_dir = os.path.join(self.config.OUTPUT_DIR, "florence2_t4x2")
         os.makedirs(out_dir, exist_ok=True)
 
-        training_args = TrainingArguments(
+        args = TrainingArguments(
             output_dir=out_dir,
             num_train_epochs=self.config.NUM_EPOCHS,
             per_device_train_batch_size=self.config.BATCH_SIZE,
@@ -364,14 +363,16 @@ class FlorenceTrainer:
             metric_for_best_model="loss",
             greater_is_better=False,
             fp16=self.config.FP16,
+            bf16=False,  # T4 no bf16
             dataloader_num_workers=0,
             dataloader_pin_memory=False,
             remove_unused_columns=False,
             report_to="tensorboard",
-            logging_dir=f"{out_dir}/runs",
+            logging_dir=os.path.join(out_dir, "runs"),
             gradient_checkpointing=self.config.GRADIENT_CHECKPOINTING,
             optim=pick_optim(),
             max_grad_norm=1.0,
+            ddp_find_unused_parameters=False,
         )
 
         class FlorenceDataset(torch.utils.data.Dataset):
@@ -380,37 +381,24 @@ class FlorenceTrainer:
                 self.processor = processor
                 self.pad_id = processor.tokenizer.pad_token_id
 
-            def __len__(self):
-                return len(self.data)
+            def __len__(self): return len(self.data)
 
             def __getitem__(self, idx):
                 ex = self.data[idx]
-                image = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
+                img = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
 
                 prompt = "<VQA>What is the volume of liquid in the beaker?"
-                answer = ex.get("volume_label", "")
-                if not answer and "volume_ml" in ex:
-                    answer = f"{ex['volume_ml']} mL"
-                if not answer:
-                    answer = "0 mL"
+                ans = ex.get("volume_label", "")
+                if not ans and "volume_ml" in ex:
+                    ans = f"{ex['volume_ml']} mL"
+                if not ans:
+                    ans = "0 mL"
 
-                inputs = self.processor(
-                    images=image,
-                    text=prompt,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                )
-                ans = self.processor.tokenizer(
-                    str(answer),
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=64,
-                )
+                inputs = self.processor(images=img, text=prompt, return_tensors="pt", padding=True, truncation=True)
+                ans_ids = self.processor.tokenizer(str(ans), return_tensors="pt", padding=True, truncation=True, max_length=64)
 
                 inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-                labels = ans["input_ids"].squeeze(0).clone()
+                labels = ans_ids["input_ids"].squeeze(0).clone()
                 if self.pad_id is not None:
                     labels[labels == self.pad_id] = -100
                 inputs["labels"] = labels
@@ -421,27 +409,28 @@ class FlorenceTrainer:
 
         trainer = Trainer(
             model=self.model,
-            args=training_args,
+            args=args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
             data_collator=florence_collate_fn,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         )
 
-        print("\n🚀 Training Florence-2 on P100...")
+        rank0_print("\n🚀 Training Florence-2 (T4×2)...")
         print_memory_usage()
         trainer.train()
 
-        final_dir = f"{self.config.OUTPUT_DIR}/florence2_final_p100"
-        trainer.save_model(final_dir)
-        self.processor.save_pretrained(final_dir)
-
+        final_dir = os.path.join(self.config.OUTPUT_DIR, "florence2_final_t4x2")
+        if is_main_process():
+            trainer.save_model(final_dir)
+            self.processor.save_pretrained(final_dir)
+        barrier()
         clear_memory()
         return final_dir
 
 
 # ============================================================================
-# QWEN2.5-VL TRAINING (P100)
+# Qwen2-VL Trainer
 # ============================================================================
 
 class QwenTrainer:
@@ -451,15 +440,11 @@ class QwenTrainer:
         self.model = None
 
     def setup_model(self):
-        print(f"\n🤖 Setting up Qwen2.5-VL: {self.config.QWEN_MODEL}")
+        rank0_print(f"\n🤖 Setting up Qwen2-VL: {self.config.QWEN_MODEL}")
         clear_memory()
+        bnb = get_bnb_config()
 
-        bnb_config = get_bnb_config()
-
-        self.processor = AutoProcessor.from_pretrained(
-            self.config.QWEN_MODEL,
-            trust_remote_code=True
-        )
+        self.processor = AutoProcessor.from_pretrained(self.config.QWEN_MODEL, trust_remote_code=True)
 
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             self.config.QWEN_MODEL,
@@ -467,16 +452,16 @@ class QwenTrainer:
             device_map="auto",
             torch_dtype=torch.float16 if self.config.FP16 else torch.float32,
             low_cpu_mem_usage=True,
-            quantization_config=bnb_config if bnb_config is not None else None,
+            quantization_config=bnb if bnb is not None else None,
         )
 
         if self.config.GRADIENT_CHECKPOINTING:
             self.model.gradient_checkpointing_enable()
-            print("✓ Gradient checkpointing enabled")
+            rank0_print("✓ Gradient checkpointing enabled")
 
         self.model = prepare_model_for_kbit_training(self.model)
 
-        lora_config = LoraConfig(
+        lora_cfg = LoraConfig(
             r=self.config.LORA_R,
             lora_alpha=self.config.LORA_ALPHA,
             target_modules=self.config.LORA_TARGET_MODULES,
@@ -484,18 +469,18 @@ class QwenTrainer:
             bias="none",
             task_type="CAUSAL_LM",
         )
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
-
+        self.model = get_peft_model(self.model, lora_cfg)
+        if is_main_process():
+            self.model.print_trainable_parameters()
         print_memory_usage()
         return self.model, self.processor
 
     def train(self, train_data: List[Dict], val_data: List[Dict]) -> str:
         self.setup_model()
-        out_dir = f"{self.config.OUTPUT_DIR}/qwen2_5vl_p100"
+        out_dir = os.path.join(self.config.OUTPUT_DIR, "qwen2vl_t4x2")
         os.makedirs(out_dir, exist_ok=True)
 
-        training_args = TrainingArguments(
+        args = TrainingArguments(
             output_dir=out_dir,
             num_train_epochs=self.config.NUM_EPOCHS,
             per_device_train_batch_size=self.config.BATCH_SIZE,
@@ -513,14 +498,16 @@ class QwenTrainer:
             metric_for_best_model="loss",
             greater_is_better=False,
             fp16=self.config.FP16,
-            dataloader_num_workers=0,     # stability on P100 machines
+            bf16=False,
+            dataloader_num_workers=0,
             dataloader_pin_memory=False,
             remove_unused_columns=False,
             report_to="tensorboard",
-            logging_dir=f"{out_dir}/runs",
+            logging_dir=os.path.join(out_dir, "runs"),
             gradient_checkpointing=self.config.GRADIENT_CHECKPOINTING,
             optim=pick_optim(),
             max_grad_norm=1.0,
+            ddp_find_unused_parameters=False,
         )
 
         class QwenDataset(torch.utils.data.Dataset):
@@ -528,21 +515,21 @@ class QwenTrainer:
                 self.data = data
                 self.processor = processor
                 self.max_length = max_length
+                self.pad_id = getattr(processor.tokenizer, "pad_token_id", None)
 
-            def __len__(self):
-                return len(self.data)
+            def __len__(self): return len(self.data)
 
             def __getitem__(self, idx):
                 ex = self.data[idx]
-                image = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
+                img = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
 
-                question = "What is the volume of liquid in this beaker in mL?"
+                q = "What is the volume of liquid in this beaker in mL?"
                 if "volume_ml" in ex:
-                    answer = f"{ex['volume_ml']} mL"
+                    a = f"{ex['volume_ml']} mL"
                 elif "volume_label" in ex:
-                    answer = str(ex["volume_label"])
+                    a = str(ex["volume_label"])
                 else:
-                    answer = "0 mL"
+                    a = "0 mL"
 
                 messages = [
                     {
@@ -556,38 +543,31 @@ class QwenTrainer:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "image", "image": image},
-                            {"type": "text", "text": question},
+                            {"type": "image", "image": img},
+                            {"type": "text", "text": q},
                         ],
                     },
                     {
                         "role": "assistant",
-                        "content": [{"type": "text", "text": answer}],
+                        "content": [{"type": "text", "text": a}],
                     },
                 ]
 
-                text = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
 
-                # IMPORTANT for P100: use dynamic padding here, and keep max_length smaller
                 inputs = self.processor(
                     text=[text],
-                    images=[image],
+                    images=[img],
                     return_tensors="pt",
-                    padding=True,           # dynamic
+                    padding=True,         # dynamic
                     truncation=True,
                     max_length=self.max_length,
                 )
 
                 inputs = {k: v.squeeze(0) for k, v in inputs.items()}
                 labels = inputs["input_ids"].clone()
-                # mask pads if tokenizer pad exists
-                pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
-                if pad_id is not None:
-                    labels[labels == pad_id] = -100
+                if self.pad_id is not None:
+                    labels[labels == self.pad_id] = -100
                 inputs["labels"] = labels
                 return inputs
 
@@ -596,62 +576,65 @@ class QwenTrainer:
 
         trainer = Trainer(
             model=self.model,
-            args=training_args,
+            args=args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
-            data_collator=qwen_collate_fn,   # critical for variable-length batches
+            data_collator=qwen_collate_fn,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         )
 
-        print("\n🚀 Training Qwen2.5-VL on P100...")
+        rank0_print("\n🚀 Training Qwen2-VL (T4×2)...")
         print_memory_usage()
         trainer.train()
 
-        final_dir = f"{self.config.OUTPUT_DIR}/qwen2_5vl_final_p100"
-        trainer.save_model(final_dir)
-        self.processor.save_pretrained(final_dir)
-
+        final_dir = os.path.join(self.config.OUTPUT_DIR, "qwen2vl_final_t4x2")
+        if is_main_process():
+            trainer.save_model(final_dir)
+            self.processor.save_pretrained(final_dir)
+        barrier()
         clear_memory()
         return final_dir
 
 
 # ============================================================================
-# EVALUATION (unchanged, but safe casts)
+# Evaluation (rank0 only)
 # ============================================================================
 
 class ModelEvaluator:
     def __init__(self, config: Config):
         self.config = config
-        self.data_processor = DatasetProcessor(config)
+        self.dp = DatasetProcessor(config)
 
-    def evaluate_model(self, model, processor, test_data: List[Dict], model_name: str) -> Dict:
-        print(f"\n📊 Evaluating {model_name} on {len(test_data)} test samples...")
-        predictions, ground_truth = [], []
-
+    def evaluate(self, model, processor, test_data: List[Dict], name: str) -> Dict:
+        if not is_main_process():
+            return {}
+        rank0_print(f"\n📊 Evaluating {name} on {len(test_data)} samples...")
         model.eval()
+
+        preds, gts = [], []
         clear_memory()
 
         with torch.no_grad():
-            for idx, ex in enumerate(test_data):
+            for i, ex in enumerate(test_data):
                 try:
-                    image = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
+                    img = Image.open(ex["image"]).convert("RGB") if isinstance(ex["image"], str) else ex["image"].convert("RGB")
 
                     gt_text = ex.get("volume_label", "")
                     if not gt_text and "volume_ml" in ex:
                         gt_text = f"{ex['volume_ml']} mL"
-                    gt_volume = self.data_processor.extract_volume_from_text(gt_text)
-                    ground_truth.append(gt_volume)
+                    gt_v = self.dp.extract_volume_from_text(gt_text)
+                    gts.append(gt_v)
 
-                    if "florence" in model_name.lower():
+                    if "florence" in name.lower():
                         prompt = "<VQA>What is the volume of liquid in the beaker?"
-                        inputs = processor(images=image, text=prompt, return_tensors="pt")
+                        inp = processor(images=img, text=prompt, return_tensors="pt")
                         model_dtype = next(model.parameters()).dtype
-                        inputs = {
+                        inp = {
                             k: (v.to(model.device).to(model_dtype) if v.dtype.is_floating_point else v.to(model.device))
-                            for k, v in inputs.items()
+                            for k, v in inp.items()
                         }
-                        gen = model.generate(**inputs, max_new_tokens=30)
-                        txt = processor.batch_decode(gen, skip_special_tokens=True)[0]
+                        out = model.generate(**inp, max_new_tokens=30)
+                        txt = processor.batch_decode(out, skip_special_tokens=True)[0]
                     else:
                         messages = [
                             {
@@ -665,125 +648,134 @@ class ModelEvaluator:
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type": "image", "image": image},
+                                    {"type": "image", "image": img},
                                     {"type": "text", "text": "What is the volume of liquid in this beaker in mL?"},
                                 ],
                             },
                         ]
                         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        inputs = processor(text=[text], images=[image], return_tensors="pt")
-                        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-                        gen = model.generate(**inputs, max_new_tokens=20, do_sample=False)
-                        txt = processor.batch_decode(gen, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                        inp = processor(text=[text], images=[img], return_tensors="pt")
+                        inp = {k: v.to(model.device) for k, v in inp.items()}
+                        out = model.generate(**inp, max_new_tokens=20, do_sample=False)
+                        txt = processor.batch_decode(out, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
-                    pred = self.data_processor.extract_volume_from_text(txt)
-                    predictions.append(pred)
+                    pred_v = self.dp.extract_volume_from_text(txt)
+                    preds.append(pred_v)
 
-                    if (idx + 1) % 50 == 0:
-                        print(f"  ✓ Evaluated {idx + 1}/{len(test_data)}")
+                    if (i + 1) % 50 == 0:
+                        rank0_print(f"  ✓ {i+1}/{len(test_data)}")
 
                 except Exception as e:
-                    print(f"⚠️ Eval error {idx}: {e}")
-                    predictions.append(0.0)
+                    rank0_print(f"⚠️ Eval error {i}: {e}")
+                    preds.append(0.0)
 
-        predictions = np.array(predictions)
-        ground_truth = np.array(ground_truth)
+        preds = np.array(preds)
+        gts = np.array(gts)
 
-        mae = mean_absolute_error(ground_truth, predictions)
-        rmse = np.sqrt(mean_squared_error(ground_truth, predictions))
-        r2 = r2_score(ground_truth, predictions)
+        mae = mean_absolute_error(gts, preds)
+        rmse = np.sqrt(mean_squared_error(gts, preds))
+        r2 = r2_score(gts, preds)
 
-        print(f"\n📈 {model_name} Results:")
-        print(f"   MAE:  {mae:.2f} mL")
-        print(f"   RMSE: {rmse:.2f} mL")
-        print(f"   R²:   {r2:.4f}")
+        rank0_print(f"\n{name} Metrics:")
+        rank0_print(f"  MAE:  {mae:.2f} mL")
+        rank0_print(f"  RMSE: {rmse:.2f} mL")
+        rank0_print(f"  R²:   {r2:.4f}")
 
         return {"mae": float(mae), "rmse": float(rmse), "r2": float(r2)}
 
 
 # ============================================================================
-# MAIN
+# Main
 # ============================================================================
 
 def main():
-    print("=" * 80)
-    print("🚀 Vision Model Training Pipeline - Florence-2 & Qwen2.5-VL (P100)")
-    print("=" * 80)
+    cfg = Config()
 
-    config = Config()
+    if is_main_process():
+        os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(cfg.TEST_IMAGES_DIR, exist_ok=True)
 
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    os.makedirs(config.TEST_IMAGES_DIR, exist_ok=True)
+    barrier()
 
-    if torch.cuda.is_available():
-        print(f"\n✅ GPU detected: {torch.cuda.get_device_name(0)}")
-        print(f"   Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    rank0_print("=" * 80)
+    rank0_print("🚀 Kaggle Training Pipeline: Florence-2 + Qwen2-VL (2×T4)")
+    rank0_print("=" * 80)
+
+    if torch.cuda.is_available() and is_main_process():
+        rank0_print(f"GPUs: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            rank0_print(f"  - {i}: {torch.cuda.get_device_name(i)}")
         print_memory_usage()
-    else:
-        print("\n❌ No GPU detected. This script is intended for P100 GPU.")
+    elif is_main_process():
+        rank0_print("❌ No GPU detected.")
 
-    data_processor = DatasetProcessor(config)
-    train_data, val_data, test_data = data_processor.load_and_split_dataset()
-    data_processor.save_test_images(test_data, config.TEST_IMAGES_DIR)
+    dp = DatasetProcessor(cfg)
+    train_data, val_data, test_data = dp.load_and_split_dataset()
 
-    # Train Florence
-    florence_trainer = FlorenceTrainer(config)
-    florence_path = florence_trainer.train(train_data, val_data)
-    del florence_trainer
+    dp.save_test_images(test_data, cfg.TEST_IMAGES_DIR)
+    barrier()
+
+    # Florence
+    flor_tr = FlorenceTrainer(cfg)
+    flor_path = flor_tr.train(train_data, val_data)
+    del flor_tr
     clear_memory()
-    print("🧹 Cleared memory after Florence training.")
-    print_memory_usage()
+    barrier()
 
-    # Train Qwen
-    qwen_trainer = QwenTrainer(config)
-    qwen_path = qwen_trainer.train(train_data, val_data)
+    # Qwen
+    qwen_tr = QwenTrainer(cfg)
+    qwen_path = qwen_tr.train(train_data, val_data)
+    barrier()
 
-    # Evaluate
-    evaluator = ModelEvaluator(config)
+    # Evaluate (rank0)
+    ev = ModelEvaluator(cfg)
 
-    florence_eval = FlorenceTrainer(config)
-    florence_eval.setup_model()
-    florence_results = evaluator.evaluate_model(florence_eval.model, florence_eval.processor, test_data, "Florence-2")
-    del florence_eval
+    flor_eval = FlorenceTrainer(cfg)
+    flor_eval.setup_model()
+    flor_res = ev.evaluate(flor_eval.model, flor_eval.processor, test_data, "Florence-2")
+    del flor_eval
     clear_memory()
 
-    qwen_results = evaluator.evaluate_model(qwen_trainer.model, qwen_trainer.processor, test_data, "Qwen2.5-VL")
+    qwen_res = ev.evaluate(qwen_tr.model, qwen_tr.processor, test_data, "Qwen2-VL")
 
-    results = {
-        "florence2": florence_results,
-        "qwen2_5vl": qwen_results,
-        "config": {
-            "gpu_target": "Tesla P100 (16GB)",
-            "use_4bit": bool(Config.USE_4BIT and _HAS_BNB),
-            "max_length": Config.MAX_LENGTH,
-            "batch_size": Config.BATCH_SIZE,
-            "gradient_accumulation": Config.GRADIENT_ACCUMULATION,
-            "effective_batch": Config.BATCH_SIZE * Config.GRADIENT_ACCUMULATION,
-        },
-        "model_paths": {"florence2": florence_path, "qwen2_5vl": qwen_path},
-    }
+    if is_main_process():
+        results = {
+            "florence2": flor_res,
+            "qwen2vl": qwen_res,
+            "paths": {"florence2": flor_path, "qwen2vl": qwen_path},
+            "config": {
+                "dataset": cfg.HF_DATASET_NAME,
+                "train": len(train_data),
+                "val": len(val_data),
+                "test": len(test_data),
+                "batch_size": cfg.BATCH_SIZE,
+                "grad_accum": cfg.GRADIENT_ACCUMULATION,
+                "effective_batch": cfg.BATCH_SIZE * cfg.GRADIENT_ACCUMULATION * max(1, torch.cuda.device_count()),
+                "max_length": cfg.MAX_LENGTH,
+                "use_4bit": bool(cfg.USE_4BIT and HAS_BNB),
+            },
+        }
+        out_json = os.path.join(cfg.OUTPUT_DIR, "evaluation_results_t4x2.json")
+        with open(out_json, "w") as f:
+            json.dump(results, f, indent=2)
 
-    results_path = f"{config.OUTPUT_DIR}/evaluation_results_p100.json"
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("\n" + "=" * 80)
-    print("🎉 TRAINING COMPLETE (P100)")
-    print("=" * 80)
-    print(f"Florence-2 saved: {florence_path}")
-    print(f"Qwen2.5-VL saved: {qwen_path}")
-    print(f"Results saved: {results_path}")
-    print(f"Test images: {config.TEST_IMAGES_DIR}")
+        rank0_print("\n" + "=" * 80)
+        rank0_print("🎉 DONE (T4×2)")
+        rank0_print("=" * 80)
+        rank0_print(f"Florence-2 saved: {flor_path}")
+        rank0_print(f"Qwen2-VL saved:   {qwen_path}")
+        rank0_print(f"Results saved:    {out_json}")
+        rank0_print(f"Test images:      {cfg.TEST_IMAGES_DIR}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n⚠️ Interrupted by user")
+        rank0_print("\n⚠️ Interrupted.")
         clear_memory()
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        rank0_print(f"\n❌ Fatal: {e}")
         import traceback
         traceback.print_exc()
         clear_memory()
