@@ -59,10 +59,10 @@ class Config:
     HF_DATASET_NAME = "yusufbukarmaina/Beakers1"
     STREAMING = True
 
-    TRAIN_SAMPLES = 1000
-    VAL_SAMPLES   = 300
+    TRAIN_SAMPLES = 500
+    VAL_SAMPLES   = 150
     TEST_SAMPLES  = 300
-    TOTAL_SAMPLES = 1600
+    TOTAL_SAMPLES = 950
 
     # Models
     FLORENCE_MODEL = "microsoft/Florence-2-base"
@@ -77,7 +77,7 @@ class Config:
     # Training (2×T4)
     # With 2 GPUs, per_device_train_batch_size=2 often works in 4-bit + checkpointing.
     # If OOM, set BATCH_SIZE=1 and increase GRAD_ACCUM.
-    BATCH_SIZE = 2
+    BATCH_SIZE = 1
     GRADIENT_ACCUMULATION = 8  # effective batch = 2(gpu)*2(batch)*8 = 32
     LEARNING_RATE = 2e-4
     NUM_EPOCHS = 8
@@ -99,7 +99,7 @@ class Config:
     LOGGING_STEPS = 50
 
     # HF upload
-    UPLOAD_TO_HF = False
+    UPLOAD_TO_HF = True
     HF_REPO_NAME = "yusufbukarmaina/beaker-volume-models"
 
 
@@ -779,3 +779,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         clear_memory()
+
