@@ -67,13 +67,13 @@ class Config:
     
     # Output settings
     OUTPUT_DIR = "./trained_models"
-    TEST_IMAGES_DIR = "./test_images"  # NEW: Export test images here
+    TEST_IMAGES_DIR = "/FQ/test_images"  # Saved BEFORE training starts
     SAVE_STEPS = 500
     EVAL_STEPS = 500
     LOGGING_STEPS = 50
     
     # HuggingFace upload
-    UPLOAD_TO_HF = True
+    UPLOAD_TO_HF = False
     HF_REPO_NAME = "yusufbukarmaina/beaker-volume-models"
 
 
@@ -97,6 +97,43 @@ def print_memory_usage():
 
 
 # ============================================================================
+# FLORENCE COLLATOR (CRITICAL FIX FOR BATCHING)
+# ============================================================================
+
+def florence_collate_fn(features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    Pads variable-length tensors for Florence-2 batches so Trainer/Dataloader can stack.
+    This fixes: RuntimeError: stack expects each tensor to be equal size
+    """
+    # pixel_values are fixed size
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
+
+    # Pad variable-length sequences
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [f["input_ids"] for f in features],
+        batch_first=True,
+        padding_value=0
+    )
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [f["attention_mask"] for f in features],
+        batch_first=True,
+        padding_value=0
+    )
+    labels = torch.nn.utils.rnn.pad_sequence(
+        [f["labels"] for f in features],
+        batch_first=True,
+        padding_value=-100
+    )
+
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
+# ============================================================================
 # DATA PROCESSING
 # ============================================================================
 
@@ -114,13 +151,14 @@ class DatasetProcessor:
         
         try:
             # Load full dataset in streaming mode
-            from datasets import load_dataset
-            dataset = load_dataset("yusufbukarmaina/Beakers1")
+            dataset = load_dataset(
+                self.config.HF_DATASET_NAME,
+                split="train",
+                streaming=self.config.STREAMING
+            )
             
             # Shuffle the dataset
-            dataset = load_dataset("yusufbukarmaina/Beakers1", split="train", streaming=True)
             dataset = dataset.shuffle(seed=42, buffer_size=1000)
-
             
             print("📊 Creating splits with streaming...")
             
@@ -138,7 +176,8 @@ class DatasetProcessor:
                     skipped += 1
                     continue
                 
-                if 'answer' not in example and 'volume' not in example:
+                # Check for volume field (volume_ml or volume_label)
+                if 'volume_ml' not in example and 'volume_label' not in example:
                     skipped += 1
                     continue
                 
@@ -229,7 +268,9 @@ class DatasetProcessor:
                     image = example['image'].convert('RGB')
                 
                 # Extract volume for filename
-                gt_text = example.get('answer', example.get('volume', ''))
+                gt_text = example.get('volume_label', '')
+                if not gt_text and 'volume_ml' in example:
+                    gt_text = f"{example['volume_ml']} mL"
                 gt_volume = self.extract_volume_from_text(gt_text)
                 
                 # Save with descriptive filename
@@ -355,15 +396,15 @@ class FlorenceTrainer:
             logging_steps=self.config.LOGGING_STEPS,
             save_steps=self.config.SAVE_STEPS,
             eval_steps=self.config.EVAL_STEPS,
-            evaluation_strategy="steps",
+            eval_strategy="steps",  # Fixed: was evaluation_strategy
             save_strategy="steps",
             save_total_limit=2,
             load_best_model_at_end=True,
             metric_for_best_model="loss",
             greater_is_better=False,
             fp16=self.config.FP16,
-            dataloader_num_workers=2,  # Reduced for stability
-            dataloader_pin_memory=True,
+            dataloader_num_workers=0,  # Set to 0 for stability
+            dataloader_pin_memory=False,  # Disable for stability
             remove_unused_columns=False,
             push_to_hub=False,
             report_to="tensorboard",
@@ -375,10 +416,15 @@ class FlorenceTrainer:
         
         # Create custom dataset class
         class FlorenceDataset(torch.utils.data.Dataset):
+            """
+            Florence-2 dataset with dynamic padding to avoid tensor size mismatches.
+            Uses padding=True for variable-length sequences.
+            """
             def __init__(self, data, processor, config):
                 self.data = data
                 self.processor = processor
                 self.config = config
+                self.pad_id = processor.tokenizer.pad_token_id
             
             def __len__(self):
                 return len(self.data)
@@ -396,60 +442,70 @@ class FlorenceTrainer:
                     # Create prompt
                     prompt = "<VQA>What is the volume of liquid in the beaker?"
                     
-                    # Get answer
-                    answer = example.get('answer', example.get('volume', ''))
+                    # Get answer - check both possible field names
+                    answer = example.get('volume_label', '')
+                    if not answer and 'volume_ml' in example:
+                        answer = f"{example['volume_ml']} mL"
+                    if not answer:
+                        answer = "0 mL"
                     
-                    # Process
+                    # Process with DYNAMIC padding (not max_length)
                     inputs = self.processor(
                         images=image,
                         text=prompt,
                         return_tensors="pt",
-                        padding="max_length",
+                        padding=True,  # Dynamic padding
                         truncation=True,
-                        max_length=self.config.MAX_LENGTH
                     )
                     
-                    # Tokenize answer
+                    # Tokenize answer (keep short)
                     answer_inputs = self.processor.tokenizer(
-                        answer,
+                        str(answer),
                         return_tensors="pt",
-                        padding="max_length",
+                        padding=True,
                         truncation=True,
-                        max_length=self.config.MAX_LENGTH
+                        max_length=64
                     )
                     
                     # Squeeze batch dimension
                     inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-                    inputs['labels'] = answer_inputs['input_ids'].squeeze(0)
+                    labels = answer_inputs['input_ids'].squeeze(0).clone()
+                    
+                    # Mask padding tokens in labels
+                    if self.pad_id is not None:
+                        labels[labels == self.pad_id] = -100
+                    
+                    inputs['labels'] = labels
                     
                     return inputs
                 
                 except Exception as e:
                     print(f"⚠️ Error processing example {idx}: {e}")
-                    # Return a dummy sample to avoid crashes
+                    # Return a minimal dummy sample
                     dummy_image = Image.new('RGB', (224, 224), color='white')
                     inputs = self.processor(
                         images=dummy_image,
                         text="<VQA>dummy",
                         return_tensors="pt",
-                        padding="max_length",
+                        padding=True,
                         truncation=True,
-                        max_length=self.config.MAX_LENGTH
                     )
                     inputs = {k: v.squeeze(0) for k, v in inputs.items()}
                     inputs['labels'] = inputs['input_ids'].clone()
+                    inputs['labels'][:] = -100  # All ignored
                     return inputs
         
         # Create datasets
         train_dataset = FlorenceDataset(train_data, self.processor, self.config)
         eval_dataset = FlorenceDataset(val_data, self.processor, self.config)
         
-        # Trainer
+        # Trainer with CUSTOM COLLATOR (fixes variable-length tensor batching)
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            data_collator=florence_collate_fn,  # CRITICAL FIX
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
         )
         
@@ -573,7 +629,7 @@ class QwenTrainer:
             logging_steps=self.config.LOGGING_STEPS,
             save_steps=self.config.SAVE_STEPS,
             eval_steps=self.config.EVAL_STEPS,
-            evaluation_strategy="steps",
+            eval_strategy="steps",  # Fixed: was evaluation_strategy
             save_strategy="steps",
             save_total_limit=2,
             load_best_model_at_end=True,
@@ -613,9 +669,24 @@ class QwenTrainer:
                     
                     # Create messages
                     question = "What is the volume of liquid in this beaker in mL?"
-                    answer = example.get('answer', example.get('volume', ''))
+                    
+                    # Get answer from correct field
+                    if 'volume_ml' in example:
+                        answer = f"{example['volume_ml']} mL"
+                    elif 'volume_label' in example:
+                        answer = str(example['volume_label'])
+                    else:
+                        answer = "unknown"
                     
                     messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a lab measurement tool. "
+                                "Respond with ONLY the volume as a number and unit, e.g. "150 mL". "
+                                "Never explain or use formulas."
+                            ),
+                        },
                         {
                             "role": "user",
                             "content": [
@@ -749,49 +820,50 @@ class ModelEvaluator:
                         image = example['image'].convert('RGB')
                     
                     # Get ground truth
-                    gt_text = example.get('answer', example.get('volume', ''))
+                    gt_text = example.get('volume_label', '')
+                    if not gt_text and 'volume_ml' in example:
+                        gt_text = f"{example['volume_ml']} mL"
                     gt_volume = self.data_processor.extract_volume_from_text(gt_text)
                     ground_truth.append(gt_volume)
                     
                     # Generate prediction
                     if 'florence' in model_name.lower():
                         prompt = "<VQA>What is the volume of liquid in the beaker?"
-                        inputs = processor(images=image, text=prompt, return_tensors="pt").to(model.device)
-                        
-                        generated_ids = model.generate(
-                            **inputs,
-                            max_new_tokens=50,
-                            num_beams=3,
-                            early_stopping=True
-                        )
-                        
+                        inputs = processor(images=image, text=prompt, return_tensors="pt")
+                        # FIX: cast to model dtype so float pixel_values match fp16 weights
+                        model_dtype = next(model.parameters()).dtype
+                        inputs = {
+                            k: v.to(model.device).to(model_dtype)
+                               if v.dtype.is_floating_point else v.to(model.device)
+                            for k, v in inputs.items()
+                        }
+                        generated_ids = model.generate(**inputs, max_new_tokens=30)
                         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
                     
                     else:  # Qwen
-                        question = "What is the volume of liquid in this beaker in mL?"
+                        # FIX: system prompt forces "X mL" only — no formulas or explanations
                         messages = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a lab measurement tool. "
+                                    "Respond with ONLY the volume as a number and unit, e.g. "150 mL". "
+                                    "Never explain or use formulas."
+                                ),
+                            },
                             {
                                 "role": "user",
                                 "content": [
                                     {"type": "image", "image": image},
-                                    {"type": "text", "text": question}
+                                    {"type": "text",  "text": "What is the volume of liquid in this beaker in mL?"}
                                 ]
                             }
                         ]
-                        
                         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
-                        
-                        generated_ids = model.generate(
-                            **inputs,
-                            max_new_tokens=50,
-                            num_beams=3,
-                            early_stopping=True
-                        )
-                        
+                        generated_ids = model.generate(**inputs, max_new_tokens=20, do_sample=False)
                         generated_text = processor.batch_decode(
-                            generated_ids,
-                            skip_special_tokens=True,
+                            generated_ids, skip_special_tokens=True,
                             clean_up_tokenization_spaces=False
                         )[0]
                     
