@@ -221,7 +221,7 @@ class Config:
     HF_DATASET_NAME = "yusufbukarmaina/Beakers1"
     STREAMING = True
     
-    TRAIN_SAMPLES = 800
+    TRAIN_SAMPLES = 500
     VAL_SAMPLES = 150
     TEST_SAMPLES = 300
     
@@ -240,7 +240,7 @@ class Config:
     LEARNING_RATE = 2e-4
     NUM_EPOCHS = 5
     WARMUP_STEPS = 50
-    MAX_LENGTH = 512
+    MAX_LENGTH = 256
     
     FP16 = True
     GRADIENT_CHECKPOINTING = True
