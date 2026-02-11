@@ -221,9 +221,9 @@ class Config:
     HF_DATASET_NAME = "yusufbukarmaina/Beakers1"
     STREAMING = True
     
-    TRAIN_SAMPLES = 1000
-    VAL_SAMPLES = 300
-    TEST_SAMPLES = 300
+    TRAIN_SAMPLES = 700
+    VAL_SAMPLES = 150
+    TEST_SAMPLES = 150
     
     FLORENCE_MODEL = "microsoft/Florence-2-base"
     QWEN_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
@@ -238,9 +238,9 @@ class Config:
     BATCH_SIZE = 1
     GRADIENT_ACCUMULATION = 16
     LEARNING_RATE = 2e-4
-    NUM_EPOCHS = 5
+    NUM_EPOCHS = 8
     WARMUP_STEPS = 50
-    MAX_LENGTH = 512
+    MAX_LENGTH = 256
     
     FP16 = True
     GRADIENT_CHECKPOINTING = True
