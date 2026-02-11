@@ -476,6 +476,52 @@ class FlorenceTrainer:
         return final_dir
 
 
+class QwenDataCollator:
+    """Custom collator that processes Qwen batches together to avoid image token mismatch"""
+    
+    def __init__(self, processor, max_image_size=512):
+        self.processor = processor
+        self.max_image_size = max_image_size
+    
+    def __call__(self, features):
+        # Extract raw data
+        batch_text = []
+        batch_images = []
+        
+        for f in features:
+            if 'text' in f and 'image' in f:
+                batch_text.append(f['text'])
+                # Resize image
+                img = resize_image(f['image'], self.max_image_size)
+                batch_images.append(img)
+        
+        if batch_text and batch_images:
+            # Process entire batch together (CRITICAL for image token alignment)
+            inputs = self.processor(
+                text=batch_text,
+                images=batch_images,
+                return_tensors="pt",
+                padding=True,
+            )
+            
+            labels = inputs['input_ids'].clone()
+            
+            return {
+                'input_ids': inputs['input_ids'],
+                'attention_mask': inputs['attention_mask'],
+                'pixel_values': inputs.get('pixel_values'),
+                'image_grid_thw': inputs.get('image_grid_thw'),
+                'labels': labels
+            }
+        
+        # Fallback
+        return {
+            'input_ids': torch.zeros((len(features), 10), dtype=torch.long),
+            'attention_mask': torch.zeros((len(features), 10), dtype=torch.long),
+            'labels': torch.full((len(features), 10), -100, dtype=torch.long)
+        }
+
+
 class QwenTrainer:
     def __init__(self, config, tracker):
         self.config = config
@@ -528,6 +574,8 @@ class QwenTrainer:
         self.tracker.record_gpu_usage('qwen2.5vl_model_loaded')
         
         class QwenDataset(torch.utils.data.Dataset):
+            """Returns raw text and images for batch processing"""
+            
             def __init__(self, data, processor, max_size):
                 self.data = data
                 self.processor = processor
@@ -538,7 +586,10 @@ class QwenTrainer:
             
             def __getitem__(self, idx):
                 example = self.data[idx]
-                image = resize_image(example['image'], self.max_size)
+                image = example['image']
+                if not isinstance(image, Image.Image):
+                    image = Image.open(image)
+                image = image.convert('RGB')
                 
                 question = "What is the volume in mL?"
                 answer = example.get('volume_label', f"{example.get('volume_ml', 0)} mL")
@@ -561,17 +612,8 @@ class QwenTrainer:
                     messages, tokenize=False, add_generation_prompt=False
                 )
                 
-                inputs = self.processor(
-                    text=[text],
-                    images=[image],
-                    return_tensors="pt",
-                    padding=True,
-                )
-                
-                inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-                inputs['labels'] = inputs['input_ids'].clone()
-                
-                return inputs
+                # Return raw data for collator to process
+                return {'text': text, 'image': image}
         
         train_dataset = QwenDataset(train_data, self.processor, self.config.MAX_IMAGE_SIZE)
         eval_dataset = QwenDataset(val_data, self.processor, self.config.MAX_IMAGE_SIZE)
@@ -595,11 +637,15 @@ class QwenTrainer:
             report_to="none",
         )
         
+        # Use custom collator for proper batch processing
+        collator = QwenDataCollator(self.processor, self.config.MAX_IMAGE_SIZE)
+        
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            data_collator=collator,  # CRITICAL: Batch processing fixes image token mismatch
             callbacks=[MetricsCallback(self.tracker, "Qwen2.5-VL")]
         )
         
