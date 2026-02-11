@@ -418,48 +418,57 @@ class QwenTrainer:
             
             def __len__(self):
                 return len(self.data)
-            
-            def __getitem__(self, i):
-                row = self.data[i]
-                img = self.dp.get_image(row['index'])  # Load on-demand
-                img = resize_image(img, self.max_size)
-                label = row['label'] or "0 mL"
-                
-                messages = [
-                    {
-                        "role": "system",
-                        "content": "Reply with ONLY the volume and unit, e.g. '150 mL'."
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img},
-                            {"type": "text", "text": "What is the volume in mL?"}
-                        ]
-                    },
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": str(label)}]
-                    }
+
+            class LazyDataset(torch.utils.data.Dataset):
+    def __init__(self, data, dp, processor, max_size):
+        self.data = data
+        self.dp = dp
+        self.processor = processor
+        self.max_size = max_size
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, i):
+        row = self.data[i]
+        img = self.dp.get_image(row['index'])
+        img = resize_image(img, self.max_size)
+        label = row['label'] or "0 mL"
+        
+        messages = [
+            {
+                "role": "system",
+                "content": "Reply with ONLY the volume and unit, e.g. '150 mL'."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "What is the volume in mL?"}
                 ]
-                
-                text = self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False
-                )
-                
-                inputs = self.processor(
-                    text=[text],
-                    images=[img],
-                    return_tensors="pt",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=256
-                )
-                
-                inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-                inputs['labels'] = inputs['input_ids'].clone()
-                
-                return inputs
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(label)}]
+            }
+        ]
+        
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        
+        # ✅ FIXED: Dynamic padding only
+        inputs = self.processor(
+            text=[text],
+            images=[img],
+            return_tensors="pt",
+            padding=True,  # Dynamic padding
+        )
+        
+        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+        inputs['labels'] = inputs['input_ids'].clone()
+        
+        return inputs
         
         train_dataset = LazyDataset(train_data, self.dp, self.processor, self.cfg.MAX_IMAGE_SIZE)
         val_dataset = LazyDataset(val_data, self.dp, self.processor, self.cfg.MAX_IMAGE_SIZE)
